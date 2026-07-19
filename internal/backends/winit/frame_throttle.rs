@@ -15,7 +15,13 @@ pub fn create_frame_throttle(
     _winit_window: &winit::window::Window,
     _is_wayland: bool,
 ) -> Box<dyn FrameThrottle> {
-    if _is_wayland {
+    // On the web, winit's request_redraw already goes through requestAnimationFrame,
+    // which is the browser's own vsync signal. Throttling on top of it with a timer both
+    // duplicates the pacing and caps it: the web backend reports no monitor refresh rate,
+    // so TimerBasedFrameThrottle takes its 60Hz fallback whatever the display does.
+    // Measured on a 144Hz screen: 16.14ms between frames while only 0.89ms of each was
+    // spent working, and a bare WebGPU canvas on the same browser held 142Hz.
+    if _is_wayland || cfg!(target_family = "wasm") {
         WinitBasedFrameThrottle::create()
     } else {
         #[cfg(target_vendor = "apple")]
