@@ -807,6 +807,14 @@ impl Window {
         self.0.is_visible()
     }
 
+    /// Returns true if this window is the active window of the windowing system, as reported by
+    /// the most recent [`WindowEvent::WindowActiveChanged`](crate::platform::WindowEvent::WindowActiveChanged).
+    /// Being active typically implies having keyboard focus. Applications can use this to pause
+    /// work, such as continuously redrawing visualizations, while the window is in the background.
+    pub fn is_active(&self) -> bool {
+        self.0.active()
+    }
+
     /// Returns a struct that implements the raw window handle traits to access the windowing system specific window
     /// and display handles.
     ///
