@@ -249,6 +249,38 @@ impl crate::Surface for WGPUSurface {
 
         self.flush_and_submit(gr_context);
 
+        // Skia drew through the raw queue pulled out of wgpu with `as_hal`, so wgpu never saw
+        // that submission: the semaphore its present waits on is unrelated to the drawing, and
+        // nothing orders scanout after it. On Android (Vulkan) this intermittently presented
+        // frames whose lower part was still unwritten (~0.1% of frames, cut at a row that moved
+        // between frames).
+        //
+        // Submitting an almost empty command buffer that references the frame texture restores
+        // the order: the semaphore signalled by this submission covers, per Vulkan's submission
+        // order rules, everything submitted to the queue before it — including Skia's work —
+        // and present waits on that semaphore. `transition_resources` is the API wgpu documents
+        // for exactly this kind of native interop barrier; the PRESENT state also hands the
+        // image over properly instead of leaving it in the layout Skia rendered it in.
+        {
+            static PRESENT_ORDER_LOG: std::sync::Once = std::sync::Once::new();
+            PRESENT_ORDER_LOG.call_once(|| {
+                i_slint_core::debug_log!("skia/wgpu-29: present ordered after Skia submission");
+            });
+
+            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Skia present ordering encoder"),
+            });
+            encoder.transition_resources(
+                std::iter::empty(),
+                std::iter::once(wgpu::TextureTransition {
+                    texture: &frame.texture,
+                    selector: None,
+                    state: wgpu::TextureUses::PRESENT,
+                }),
+            );
+            self.queue.submit(Some(encoder.finish()));
+        }
+
         if let Some(pre_present_callback) = pre_present_callback.borrow_mut().as_mut() {
             pre_present_callback();
         }
