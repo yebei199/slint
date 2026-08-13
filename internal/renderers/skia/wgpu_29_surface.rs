@@ -20,7 +20,7 @@ use crate::SkiaSharedContext;
 mod dx12;
 #[cfg(target_vendor = "apple")]
 mod metal;
-#[cfg(all(target_family = "unix", not(target_vendor = "apple")))]
+#[cfg(skia_wgpu_vulkan)]
 mod vulkan;
 
 /// See [`crate::attachment_color_space`].
@@ -84,7 +84,7 @@ impl WGPUSurface {
         surface_config.format = swapchain_format;
         surface.configure(&device, &surface_config);
 
-        let backend: Backend = adapter.get_info().backend.try_into()?;
+        let backend = Backend::new(&adapter, &device)?;
 
         let gr_context = backend.make_context(&adapter, &device, &queue);
 
@@ -240,46 +240,30 @@ impl crate::Surface for WGPUSurface {
             }
         };
 
-        let skia_surface = self.backend.make_surface(gr_context, &frame.texture);
+        let skia_surface = self.backend.make_swapchain_surface(gr_context, &frame.texture);
 
         let mut skia_surface = skia_surface
             .ok_or_else(|| PlatformError::from("Failed to create Skia surface from WGPU"))?;
 
         callback(skia_surface.canvas(), Some(gr_context), 0);
 
+        self.backend.release_swapchain_surface(gr_context, &mut skia_surface);
+
         self.flush_and_submit(gr_context);
 
-        // Skia drew through the raw queue pulled out of wgpu with `as_hal`, so wgpu never saw
-        // that submission: the semaphore its present waits on is unrelated to the drawing, and
-        // nothing orders scanout after it. On Android (Vulkan) this intermittently presented
-        // frames whose lower part was still unwritten (~0.1% of frames, cut at a row that moved
-        // between frames).
-        //
-        // Submitting an almost empty command buffer that references the frame texture restores
-        // the order: the semaphore signalled by this submission covers, per Vulkan's submission
-        // order rules, everything submitted to the queue before it — including Skia's work —
-        // and present waits on that semaphore. `transition_resources` is the API wgpu documents
-        // for exactly this kind of native interop barrier; the PRESENT state also hands the
-        // image over properly instead of leaving it in the layout Skia rendered it in.
-        {
-            static PRESENT_ORDER_LOG: std::sync::Once = std::sync::Once::new();
-            PRESENT_ORDER_LOG.call_once(|| {
-                i_slint_core::debug_log!("skia/wgpu-29: present ordered after Skia submission");
-            });
-
-            let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("Skia present ordering encoder"),
-            });
-            encoder.transition_resources(
-                std::iter::empty(),
-                std::iter::once(wgpu::TextureTransition {
-                    texture: &frame.texture,
-                    selector: None,
-                    state: wgpu::TextureUses::PRESENT,
-                }),
-            );
-            self.queue.submit(Some(encoder.finish()));
-        }
+        // Skia drew via the raw queue behind wgpu's back; referencing the frame texture in a submission makes the present semaphore wait for that work.
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Skia present ordering encoder"),
+        });
+        encoder.transition_resources(
+            std::iter::empty(),
+            std::iter::once(wgpu::TextureTransition {
+                texture: &frame.texture,
+                selector: None,
+                state: wgpu::TextureUses::PRESENT,
+            }),
+        );
+        self.queue.submit(Some(encoder.finish()));
 
         if let Some(pre_present_callback) = pre_present_callback.borrow_mut().as_mut() {
             pre_present_callback();
@@ -383,20 +367,34 @@ pub(crate) enum Backend {
     Metal,
     #[cfg(target_family = "windows")]
     Dx12,
-    #[cfg(all(target_family = "unix", not(target_vendor = "apple")))]
-    Vulkan,
+    #[cfg(skia_wgpu_vulkan)]
+    Vulkan {
+        /// The family Skia has to hand the swapchain image back to, see
+        /// [`Backend::release_swapchain_surface`].
+        queue_family_index: u32,
+    },
 }
 
-impl TryFrom<wgpu::Backend> for Backend {
-    type Error = PlatformError;
-
-    fn try_from(wgpu_backend: wgpu::Backend) -> Result<Self, Self::Error> {
-        match wgpu_backend {
+impl Backend {
+    pub(crate) fn new(
+        adapter: &wgpu::Adapter,
+        _device: &wgpu::Device,
+    ) -> Result<Self, PlatformError> {
+        match adapter.get_info().backend {
             wgpu_29::Backend::Noop => {
                 Err(PlatformError::from("Cannot use WGPU Noop backend with Skia"))
             }
-            #[cfg(all(target_family = "unix", not(target_vendor = "apple")))]
-            wgpu_29::Backend::Vulkan => Ok(Self::Vulkan),
+            #[cfg(skia_wgpu_vulkan)]
+            wgpu_29::Backend::Vulkan => Ok(Self::Vulkan {
+                // SAFETY: `_device` is a Vulkan device, as the adapter's backend just said.
+                queue_family_index: unsafe { vulkan::queue_family_index(_device) }.ok_or_else(
+                    || {
+                        PlatformError::from(
+                            "Cannot query the queue family of the WGPU Vulkan device",
+                        )
+                    },
+                )?,
+            }),
             #[cfg(target_vendor = "apple")]
             wgpu_29::Backend::Metal => Ok(Self::Metal),
             #[cfg(target_family = "windows")]
@@ -407,9 +405,7 @@ impl TryFrom<wgpu::Backend> for Backend {
             ))),
         }
     }
-}
 
-impl Backend {
     pub(crate) fn make_context(
         &self,
         _adapter: &wgpu::Adapter,
@@ -421,8 +417,8 @@ impl Backend {
             Self::Metal => metal::make_metal_context(device, queue),
             #[cfg(target_family = "windows")]
             Self::Dx12 => unsafe { dx12::make_dx12_context(&_adapter, &device, &queue) },
-            #[cfg(all(target_family = "unix", not(target_vendor = "apple")))]
-            Self::Vulkan => unsafe { vulkan::make_vulkan_context(device, queue) },
+            #[cfg(skia_wgpu_vulkan)]
+            Self::Vulkan { .. } => unsafe { vulkan::make_vulkan_context(device, queue) },
         }
     }
 
@@ -436,8 +432,67 @@ impl Backend {
             Self::Metal => unsafe { metal::make_metal_surface(gr_context, texture) },
             #[cfg(target_family = "windows")]
             Self::Dx12 => unsafe { dx12::make_dx12_surface(gr_context, texture) },
-            #[cfg(all(target_family = "unix", not(target_vendor = "apple")))]
-            Self::Vulkan => unsafe { vulkan::make_vulkan_surface(gr_context, texture) },
+            #[cfg(skia_wgpu_vulkan)]
+            Self::Vulkan { .. } => unsafe {
+                vulkan::make_vulkan_surface(
+                    gr_context,
+                    texture,
+                    skia_safe::gpu::vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                )
+            },
+        }
+    }
+
+    /// Like [`Self::make_surface`], but for the swapchain image handed out by
+    /// [`wgpu::Surface::get_current_texture`].
+    ///
+    /// Nothing on this path writes the image before Skia does, so a freshly created swapchain
+    /// hands out images that are still in `UNDEFINED`, and naming the `PRESENT` layout wgpu
+    /// leaves them in from the second frame on would make Skia's barrier claim a layout the
+    /// image isn't in yet. `UNDEFINED` is accurate for the first use and legal for every later
+    /// one, at the price of discarding the previous contents, which this path never reads:
+    /// `render()` passes a buffer age of 0, so the scene is repainted in full every frame.
+    /// Pair every call with [`Self::release_swapchain_surface`].
+    pub(crate) fn make_swapchain_surface(
+        &self,
+        gr_context: &mut skia_safe::gpu::DirectContext,
+        texture: &wgpu::Texture,
+    ) -> Option<skia_safe::Surface> {
+        match self {
+            #[cfg(target_vendor = "apple")]
+            Self::Metal => unsafe { metal::make_metal_surface(gr_context, texture) },
+            #[cfg(target_family = "windows")]
+            Self::Dx12 => unsafe { dx12::make_dx12_surface(gr_context, texture) },
+            #[cfg(skia_wgpu_vulkan)]
+            Self::Vulkan { .. } => unsafe {
+                vulkan::make_vulkan_surface(
+                    gr_context,
+                    texture,
+                    skia_safe::gpu::vk::ImageLayout::UNDEFINED,
+                )
+            },
+        }
+    }
+
+    /// Hands a surface made by [`Self::make_swapchain_surface`] back in the state
+    /// [`wgpu::SurfaceTexture::present`] expects to find it in.
+    pub(crate) fn release_swapchain_surface(
+        &self,
+        _gr_context: &mut skia_safe::gpu::DirectContext,
+        _skia_surface: &mut skia_safe::Surface,
+    ) {
+        match self {
+            // Metal and D3D12 have no image layout for Skia to hand back.
+            #[cfg(target_vendor = "apple")]
+            Self::Metal => {}
+            #[cfg(target_family = "windows")]
+            Self::Dx12 => {}
+            #[cfg(skia_wgpu_vulkan)]
+            Self::Vulkan { queue_family_index } => vulkan::release_vulkan_swapchain_surface(
+                _gr_context,
+                _skia_surface,
+                *queue_family_index,
+            ),
         }
     }
 
@@ -451,8 +506,8 @@ impl Backend {
             Self::Metal => unsafe { metal::import_metal_texture(canvas, texture) },
             #[cfg(target_family = "windows")]
             Self::Dx12 => unsafe { dx12::import_dx12_texture(canvas, texture) },
-            #[cfg(all(target_family = "unix", not(target_vendor = "apple")))]
-            Self::Vulkan => unsafe { vulkan::import_vulkan_texture(canvas, texture) },
+            #[cfg(skia_wgpu_vulkan)]
+            Self::Vulkan { .. } => unsafe { vulkan::import_vulkan_texture(canvas, texture) },
         }
     }
 }
