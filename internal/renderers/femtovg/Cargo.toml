@@ -35,11 +35,10 @@ cfg-if = "1"
 derive_more = { workspace = true }
 lyon_path = { workspace = true }
 pin-weak = "1"
-# 指向 fork 的 dev:上游的 wgpu 后端在 wasm 上每个绘制元素要花约 0.5ms 的 GPU 进程
-# 时间(每个 draw 新建 6 个 GPU 对象),dev 把它压掉了。dev = femtovg master 加上
-# femtovg#302 的十个 commit,版本跟着上游走,对依赖方无差别。#302 合并后这里改回
-# crates.io。
-femtovg = { git = "https://github.com/yebei199/femtovg", branch = "dev", default-features = false, features = ["swash"] }
+# 指向上游 git 而不是 crates.io:femtovg#302(wgpu 后端每个 draw 新建 6 个 GPU
+# 对象、wasm 上每元素约 0.5ms 的开销修复)已于 2026-08-17 并入上游 master,但最新
+# 发布 0.26.0 早于合并、不含它。上游发出含 #302 的版本后这里改回 crates.io。
+femtovg = { git = "https://github.com/femtovg/femtovg", default-features = false, features = ["swash"] }
 imgref = { version = "1.6.1" }
 rgb = { version = "0.8.27" }
 
