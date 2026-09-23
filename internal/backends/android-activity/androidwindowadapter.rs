@@ -6,7 +6,7 @@
 use super::*;
 use crate::javahelper::{JavaHelper, print_jni_error};
 use android_activity::input::{
-    ButtonState, InputEvent, KeyAction, Keycode, MotionAction, MotionEvent,
+    Axis, ButtonState, InputEvent, KeyAction, Keycode, MotionAction, MotionEvent,
 };
 use android_activity::{InputStatus, MainEvent, PollEvent};
 use i_slint_core::SharedString;
@@ -430,7 +430,28 @@ impl AndroidWindowAdapter {
                             }
                             InputStatus::Handled
                         }
-                        MotionAction::Scroll => todo!(),
+                        MotionAction::Scroll => {
+                            // Mouse wheel / touchpad: Android reports detents (±1.0 each,
+                            // fractional on high-resolution wheels). Convert with the same
+                            // 60px-per-line factor the winit backend uses for LineDelta.
+                            // Slint's delta is how far the content moves: AXIS_VSCROLL > 0
+                            // (wheel up) moves it down, AXIS_HSCROLL > 0 (scroll right)
+                            // moves it left.
+                            const PIXELS_PER_LINE: f32 = 60.;
+                            let position = position_for_event(motion_event, offset, scale);
+                            let (delta_x, delta_y) =
+                                motion_event.pointers().next().map_or((0., 0.), |p| {
+                                    (
+                                        -p.axis_value(Axis::Hscroll) * PIXELS_PER_LINE,
+                                        p.axis_value(Axis::Vscroll) * PIXELS_PER_LINE,
+                                    )
+                                });
+                            let window_event =
+                                WindowEvent::PointerScrolled { position, delta_x, delta_y };
+                            result =
+                                self.window.dispatch_event_with_result(window_event).map(|_| ());
+                            InputStatus::Handled
+                        }
                         MotionAction::HoverEnter | MotionAction::HoverExit => {
                             InputStatus::Unhandled
                         }
